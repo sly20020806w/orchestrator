@@ -1,0 +1,229 @@
+# =============================================================================
+# Orchestrator Kubernetes 部署文件（Raft 3节点高可用模式）
+# =============================================================================
+# 包含：
+#   1. Namespace
+#   2. ConfigMap（配置文件 + Hook脚本）
+#   3. Service（Headless Service 用于 Raft 通信 + ClusterIP 用于 Web/API）
+#   4. StatefulSet（3节点 Raft 集群）
+# =============================================================================
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: orchestrator
+---
+# =============================================================================
+# ConfigMap：Orchestrator 主配置
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: orchestrator-config
+  namespace: orchestrator
+data:
+  orchestrator.conf.json: |
+    {
+      "Debug": false,
+      "EnableSyslog": false,
+      "ListenAddress": ":3000",
+      "MySQLTopologyUser": "orchestrator",
+      "MySQLTopologyPassword": "orchestrator_password",
+      "BackendDB": "sqlite",
+      "SQLite3DataFile": "/var/lib/orchestrator/orchestrator.db",
+      "MySQLConnectTimeoutSeconds": 1,
+      "DefaultInstancePort": 3306,
+      "DiscoverByShowSlaveHosts": true,
+      "InstancePollSeconds": 5,
+      "RecoveryPeriodBlockSeconds": 3600,
+      "RecoverMasterClusterFilters": ["*"],
+      "RecoverIntermediateMasterClusterFilters": ["*"],
+      "OnFailureDetectionProcesses": [
+        "echo 'Detected {failureType} on {failureCluster}/{failureHost}' >> /var/log/orchestrator/failure.log"
+      ],
+      "PostMasterFailoverProcesses": [
+        "/etc/orchestrator/hooks/update-proxysql.sh"
+      ],
+      "UseGTID": true,
+      "RaftEnabled": true,
+      "RaftDataDir": "/var/lib/orchestrator",
+      "RaftBind": "$HOSTNAME.orchestrator-headless.orchestrator.svc.cluster.local",
+      "DefaultRaftPort": 10008,
+      "RaftNodes": [
+        "orchestrator-0.orchestrator-headless.orchestrator.svc.cluster.local",
+        "orchestrator-1.orchestrator-headless.orchestrator.svc.cluster.local",
+        "orchestrator-2.orchestrator-headless.orchestrator.svc.cluster.local"
+      ],
+      "RaftTimeoutMillis": 1000,
+      "HTTPAuthUser": "admin",
+      "HTTPAuthPassword": "admin",
+      "ReasonableReplicationLagSeconds": 10
+    }
+---
+# =============================================================================
+# ConfigMap：ProxySQL 联动 Hook 脚本
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: orchestrator-hooks
+  namespace: orchestrator
+data:
+  update-proxysql.sh: |
+    #!/bin/bash
+    set -e
+    PROXYSQL_HOST="proxysql.default.svc.cluster.local"
+    PROXYSQL_PORT="6032"
+    PROXYSQL_USER="admin"
+    PROXYSQL_PASS="admin"
+    WRITER_HOSTGROUP=10
+    READER_HOSTGROUP=20
+    LOG_FILE="/var/log/orchestrator/proxysql-update.log"
+
+    OLD_MASTER="${ORC_FAILED_OVER_FROM_HOST:-}"
+    NEW_MASTER="${ORC_FAILED_OVER_TO_HOST:-}"
+
+    echo "[$(date)] 主库切换: ${OLD_MASTER} -> ${NEW_MASTER}" | tee -a "$LOG_FILE"
+
+    if [ -z "$NEW_MASTER" ]; then
+      echo "错误：未获取到新主库" | tee -a "$LOG_FILE"
+      exit 1
+    fi
+
+    mysql -h"${PROXYSQL_HOST}" -P"${PROXYSQL_PORT}" -u"${PROXYSQL_USER}" -p"${PROXYSQL_PASS}" 2>/dev/null <<EOF
+    UPDATE mysql_servers SET hostgroup_id=${WRITER_HOSTGROUP}, status='ONLINE' WHERE hostname='${NEW_MASTER}';
+    UPDATE mysql_servers SET hostgroup_id=${READER_HOSTGROUP} WHERE hostname='${OLD_MASTER}';
+    DELETE FROM mysql_servers WHERE hostgroup_id=${WRITER_HOSTGROUP} AND hostname != '${NEW_MASTER}';
+    LOAD MYSQL SERVERS TO RUNTIME;
+    SAVE MYSQL SERVERS TO DISK;
+EOF
+
+    echo "[$(date)] ProxySQL 路由更新完成" | tee -a "$LOG_FILE"
+    exit 0
+---
+# =============================================================================
+# Headless Service：用于 StatefulSet Pod 固定域名（Raft 节点间通信）
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: orchestrator-headless
+  namespace: orchestrator
+spec:
+  clusterIP: None
+  selector:
+    app: orchestrator
+  ports:
+  - name: raft
+    port: 10008
+    targetPort: 10008
+  - name: web
+    port: 3000
+    targetPort: 3000
+---
+# =============================================================================
+# ClusterIP Service：Web 界面和 API 访问入口
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: orchestrator
+  namespace: orchestrator
+spec:
+  type: ClusterIP
+  selector:
+    app: orchestrator
+  ports:
+  - name: web
+    port: 3000
+    targetPort: 3000
+---
+# =============================================================================
+# StatefulSet：3节点 Raft 集群
+# =============================================================================
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: orchestrator
+  namespace: orchestrator
+spec:
+  serviceName: orchestrator-headless
+  replicas: 3
+  selector:
+    matchLabels:
+      app: orchestrator
+  template:
+    metadata:
+      labels:
+        app: orchestrator
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values: ["orchestrator"]
+            topologyKey: "kubernetes.io/hostname"
+      containers:
+      - name: orchestrator
+        image: openark/orchestrator:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: web
+          containerPort: 3000
+        - name: raft
+          containerPort: 10008
+        env:
+        - name: HOSTNAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        volumeMounts:
+        - name: config
+          mountPath: /etc/orchestrator.conf.json
+          subPath: orchestrator.conf.json
+        - name: hooks
+          mountPath: /etc/orchestrator/hooks
+        - name: data
+          mountPath: /var/lib/orchestrator
+        - name: logs
+          mountPath: /var/log/orchestrator
+        resources:
+          requests:
+            cpu: "200m"
+            memory: "256Mi"
+          limits:
+            cpu: "1"
+            memory: "512Mi"
+        livenessProbe:
+          httpGet:
+            path: /api/health
+            port: 3000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /api/health
+            port: 3000
+          initialDelaySeconds: 10
+          periodSeconds: 5
+      volumes:
+      - name: config
+        configMap:
+          name: orchestrator-config
+      - name: hooks
+        configMap:
+          name: orchestrator-hooks
+          defaultMode: 0755
+      - name: logs
+        emptyDir: {}
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 1Gi
